@@ -317,10 +317,33 @@ class Delta {
     return new Delta(ops);
   }
 
+  /**
+   * Compose two Deltas into one.
+   *
+   * 该方法用于将当前 Delta 与另一个 Delta 进行合并，形成一个等效于「先执行 this，再执行 other」的复合操作。
+   * 在富文本编辑器或协同编辑场景中，当一个用户连续执行多次变更（如先插入文字，再应用样式），
+   * 可以通过 compose 合并为一个 Delta，优化存储与同步效率。
+   *
+   * ### 合并规则说明：
+   * - Insert 与 Retain：合并样式或嵌入内容，保留变更。
+   * - Insert 与 Delete：互相抵消（插入后立刻删除，结果为空）。
+   * - Delete 与任何：删除优先，内容被移除。
+   *
+   * ### 特殊优化：
+   * - 支持对连续 Retain 开头的 Delta 进行跳过加速处理。
+   * - 若 other Delta 的尾部全为 retain 且未变更，提前终止。
+   *
+   * @param other - 要合并的另一个 Delta。
+   * @returns 一个新的 Delta，其效果等同于 `this` 和 `other` 顺序执行的合并结果。
+   */
   compose(other: Delta): Delta {
     const thisIter = new OpIterator(this.ops);
     const otherIter = new OpIterator(other.ops);
     const ops = [];
+
+    // 优化前置处理：
+    // 如果 other 的第一个 op 是 retain 且无样式（代表前面是空操作），
+    // 则从 this 中复制对应数量的 insert 到结果中
     const firstOther = otherIter.peek();
     if (
       firstOther != null &&
@@ -333,35 +356,47 @@ class Delta {
         thisIter.peekLength() <= firstLeft
       ) {
         firstLeft -= thisIter.peekLength();
-        ops.push(thisIter.next());
+        ops.push(thisIter.next()); // 把头部 insert 搬过来
       }
       if (firstOther.retain - firstLeft > 0) {
-        otherIter.next(firstOther.retain - firstLeft);
+        otherIter.next(firstOther.retain - firstLeft); // 部分消费 other 的 retain
       }
     }
-    const delta = new Delta(ops);
+
+    const delta = new Delta(ops); // 初始 delta 已包含前置 insert
+
     while (thisIter.hasNext() || otherIter.hasNext()) {
+      // case1: other 是 insert，优先放入结果
       if (otherIter.peekType() === 'insert') {
         delta.push(otherIter.next());
-      } else if (thisIter.peekType() === 'delete') {
+      }
+      // case2: this 是 delete，保留删除操作
+      else if (thisIter.peekType() === 'delete') {
         delta.push(thisIter.next());
-      } else {
+      }
+      // case3: 处理 retain 或 retain + delete 的合并
+      else {
         const length = Math.min(thisIter.peekLength(), otherIter.peekLength());
         const thisOp = thisIter.next(length);
         const otherOp = otherIter.next(length);
+
         if (otherOp.retain) {
           const newOp: Op = {};
+
+          // 处理 retain 数值 or 对象逻辑
           if (typeof thisOp.retain === 'number') {
             newOp.retain =
               typeof otherOp.retain === 'number' ? length : otherOp.retain;
           } else {
             if (typeof otherOp.retain === 'number') {
+              // 本轮是 insert op
               if (thisOp.retain == null) {
                 newOp.insert = thisOp.insert;
               } else {
                 newOp.retain = thisOp.retain;
               }
             } else {
+              // 双方都是 embed retain，调用 handler.compose
               const action = thisOp.retain == null ? 'insert' : 'retain';
               const [embedType, thisData, otherData] = getEmbedTypeAndData(
                 thisOp[action],
@@ -377,7 +412,8 @@ class Delta {
               };
             }
           }
-          // Preserve null when composing with a retain, otherwise remove it for inserts
+
+          // 合并样式
           const attributes = AttributeMap.compose(
             thisOp.attributes,
             otherOp.attributes,
@@ -386,9 +422,10 @@ class Delta {
           if (attributes) {
             newOp.attributes = attributes;
           }
+
           delta.push(newOp);
 
-          // Optimization if rest of other is just retain
+          // 优化：如果 other 剩下的都是 retain 且当前结果等于 last op
           if (
             !otherIter.hasNext() &&
             isEqual(delta.ops[delta.ops.length - 1], newOp)
@@ -396,18 +433,18 @@ class Delta {
             const rest = new Delta(thisIter.rest());
             return delta.concat(rest).chop();
           }
-
-          // Other op should be delete, we could be an insert or retain
-          // Insert + delete cancels out
-        } else if (
+        }
+        // case4: other 是 delete，this 是 retain/insert
+        else if (
           typeof otherOp.delete === 'number' &&
           (typeof thisOp.retain === 'number' ||
             (typeof thisOp.retain === 'object' && thisOp.retain !== null))
         ) {
-          delta.push(otherOp);
+          delta.push(otherOp); // 直接保留删除
         }
       }
     }
+
     return delta.chop();
   }
 
@@ -560,74 +597,76 @@ class Delta {
   transform(other: Delta, priority?: boolean): Delta;
   /**
    * 将一个操作转化为另一个操作，以便于实现实时协同编辑。
+   * 规则：
+   *  - 如果当前操作是插入并且具有优先级，则保留位置以移动光标。
+   *  - 如果其他操作是插入，则直接将操作插入到结果中。
+   *  - 如果两个操作都是删除或保留，则取最小长度并对齐操作。
+   *  - 如果两个操作都是保留，则合并保留长度和属性（样式）。
    *
    * @param arg - 要转化的操作，可以是数字索引或 Delta 对象。
    * @param priority - 转化的优先级，默认为 false。
    * @returns 转化后的操作，可以是数字索引或 Delta 对象。
    */
   transform(arg: number | Delta, priority = false): typeof arg {
-    /** 将优先级转化为布尔值 */
+    // 强制转为布尔值
     priority = !!priority;
 
-    /** 如果 arg 是数字索引，则转化为位置 */
+    // 如果是数字，处理位置转换
     if (typeof arg === 'number') {
       return this.transformPosition(arg, priority);
     }
 
     const other: Delta = arg;
 
-    /** 创建两个操作迭代器 */
-    const thisIter = new OpIterator(this.ops);
-    const otherIter = new OpIterator(other.ops);
+    const thisIter = new OpIterator(this.ops); // 当前操作序列
+    const otherIter = new OpIterator(other.ops); // 传入的并发操作序列
 
-    /** 创建一个新的 Delta 对象 */
-    const delta = new Delta();
+    const delta = new Delta(); // 结果 Delta
 
-    /** 遍历两个操作列表*/
     while (thisIter.hasNext() || otherIter.hasNext()) {
-      /** 如果当前操作是插入类型，并且优先级为 true 或其他操作不是插入类型，则保留当前操作 */
+      /**
+       * 优先处理 this 的插入操作：
+       * - 如果当前是插入，且 (priority = true 或者 other 当前不是 insert)，
+       *   说明当前用户拥有插入优先级，对方的光标需要向后偏移。
+       */
       if (
         thisIter.peekType() === 'insert' &&
         (priority || otherIter.peekType() !== 'insert')
       ) {
-        delta.retain(Op.length(thisIter.next()));
+        delta.retain(Op.length(thisIter.next())); // 增加保留，表示位置后移
       } else if (otherIter.peekType() === 'insert') {
-        /** 如果其他操作是插入类型，则添加到新的 Delta 对象中 */
+        // 如果对方是插入，则直接插入到结果中（因为当前不是 insert，或者优先级更低）
         delta.push(otherIter.next());
       } else {
-        /** 如果两个操作都是保留类型或删除类型，则合并它们 */
+        // 此时双方都是 delete 或 retain，取最小长度以对齐处理
         const length = Math.min(thisIter.peekLength(), otherIter.peekLength());
         const thisOp = thisIter.next(length);
         const otherOp = otherIter.next(length);
 
-        /** 如果当前操作是删除类型，则跳过 */
         if (thisOp.delete) {
+          // 当前操作是删除，说明内容已经不存在，对方 retain/delete 都跳过
           continue;
         } else if (otherOp.delete) {
-          /** 如果其他操作是删除类型，则添加到新的 Delta 对象中 */
+          // 我是 retain，对方是删除，对方直接保留此操作
           delta.push(otherOp);
         } else {
-          /** 如果两个操作都是保留类型，则合并它们 */
+          // 双方都是 retain，需要合并 retain 长度和属性（样式）
           const thisData = thisOp.retain;
           const otherData = otherOp.retain;
 
-          /** 初始化转化后的数据 */
           let transformedData: Op['retain'] =
             typeof otherData === 'object' && otherData !== null
               ? otherData
               : length;
 
-          /** 如果两个操作的数据都是对象类型，则合并它们 */
+          // 如果两者都是对象 retain（嵌入内容），尝试调用嵌入的 handler.transform
           if (
             typeof thisData === 'object' &&
             thisData !== null &&
             typeof otherData === 'object' &&
             otherData !== null
           ) {
-            /**  获取嵌入类型 */
             const embedType = Object.keys(thisData)[0];
-
-            /** 如果两个操作的嵌入类型相同，则合并它们 */
             if (embedType === Object.keys(otherData)[0]) {
               const handler = Delta.getHandler(embedType);
               if (handler) {
@@ -642,20 +681,19 @@ class Delta {
             }
           }
 
-          /** 保留转化后的数据 */
-          delta.retain(
-            transformedData,
-            AttributeMap.transform(
-              thisOp.attributes,
-              otherOp.attributes,
-              priority,
-            ),
+          // 合并样式属性，保留变更
+          const transformedAttributes = AttributeMap.transform(
+            thisOp.attributes,
+            otherOp.attributes,
+            priority,
           );
+
+          delta.retain(transformedData, transformedAttributes);
         }
       }
     }
 
-    /** 删除最后一个操作 */
+    // 清理末尾冗余 retain，返回最终结果
     return delta.chop();
   }
 
